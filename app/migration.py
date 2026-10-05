@@ -17,6 +17,12 @@
   当前序号的决定/评语必须落在当前发布方案槽位上、各表主键/唯一约束不冲突);
   历史记录 (决定/评语/回避/资格变更/更正/快照/异议) 按保留规则可指向已删除的
   论文或评审人, 不作存在性要求;
+- 反馈快照访问码效力做跨记录核验: invalidated 标记必须与快照版本、评语更正请求
+  (同论文同发布序号、冻结收据与快照两份收据取交集) 和论文撤回记录交叉一致——
+  已因更正或撤回失效的快照不能因"仍属当前发布序号"而被改回有效后复活;
+  无失效证据的失效标记同样按矛盾快照拒绝; 跨发布序号的历史快照仅作历史保留迁移,
+  由读口径的"序号须为当前发布序号"拒绝读取, 不要求失效标记;
+  矛盾快照 422 拒绝, 全部写入回滚, 目标实例不留部分数据;
 - 仅接受尚无业务记录 (全部业务表为空且资料修订号为 0) 且从未恢复过的目标实例;
   校验失败 (422)、目标非空或重复恢复 (409) 一律拒绝且不留下部分数据——
   全部写入在同一个 BEGIN IMMEDIATE 写事务内完成, 任一失败整体回滚;
@@ -429,6 +435,12 @@ def validate_snapshot(data) -> None:
     但锁定表与保障等级随论文删除/撤回级联清除、撤回记录与 withdrawn 标记一一对应、
     异议必须指向现存快照版本、按发布序号隔离的记录不得越过当前发布序号、
     当前序号的决定/评语必须落在当前发布方案槽位上——这些不变量必须成立。
+
+    反馈快照失效标记还须通过跨记录核验 (防"失效标记改回有效 + 重算校验和"复活):
+    快照的 invalidated 标记必须与快照版本、评语更正请求 (同论文同发布序号下
+    冻结的原评语收据命中快照两份收据之一) 和论文撤回记录交叉一致。已因更正或撤回
+    失效的快照即使仍属当前发布序号也必须保持失效; 无失效证据的失效标记同样拒绝。
+    跨发布序号的历史快照不要求失效标记 (由读口径拒绝读取, 仅供会务方追溯)。
     """
     if not isinstance(data, dict):
         _fail("data", "必须是对象")
@@ -634,6 +646,7 @@ def validate_snapshot(data) -> None:
 
     # ---- 匿名反馈快照 (历史保留: 可指向已删除论文; 访问码全局唯一)
     snapshot_ids, access_codes, seen = set(), set(), set()
+    snapshot_versions = set()
     snapshot_by_id = {}
     for s in data["feedback_snapshots"]:
         where = "data.feedback_snapshots"
@@ -657,6 +670,7 @@ def validate_snapshot(data) -> None:
         _check_serial(s["serial"], where)
         _check_unique(snapshot_ids, s["id"], where, "快照 id")
         _check_unique(access_codes, s["access_code"], where, "快照访问码")
+        _check_unique(snapshot_versions, (s["paper_id"], s["version"]), where, "同论文快照版本号")
         _check_unique(
             seen,
             (s["paper_id"], s["serial"], s["receipt1"], s["receipt2"]),
@@ -789,6 +803,9 @@ def validate_snapshot(data) -> None:
                 _fail(where, "待处理异议的发布序号必须是当前发布序号 (否则应已过期)")
             if o["decided_at"] is not None:
                 _fail(where, "待处理异议不得携带处理时间")
+            # 撤回在同一事务内把该稿全部待处理异议原子过期, 撤回稿上不得残留 pending 异议
+            if o["paper_id"] in withdrawn_ids:
+                _fail(where, f"论文 {o['paper_id']!r} 已撤回, 其待处理异议应已随撤回过期")
         else:
             if o["decided_at"] is None:
                 _fail(where, "已处理/已过期异议必须携带处理时间")
@@ -835,6 +852,61 @@ def validate_snapshot(data) -> None:
             "data.paper_withdrawals",
             f"已撤回论文缺少撤回记录: {sorted(missing)} (撤回与记录同事务写入)",
         )
+
+    # ---- 反馈快照失效标记的跨记录核验 (恢复前的访问码效力核验)
+    # 快照访问码的效力不得仅由其自身行的 invalidated 标记决定: 依据快照版本、
+    # 评语更正请求与论文撤回记录交叉核对, 已因更正或撤回失效的快照不能因"仍属
+    # 当前发布序号"而被改回有效后复活。命中任一失效证据的快照必须带 invalidated=true;
+    # 不命中任何失效证据的快照必须为 invalidated=false (无证据的失效标记同样是矛盾
+    # 快照, 历史内容仍随快照行保留供会务方追溯, 但整个快照 422 拒绝恢复)。
+    #
+    # 失效证据 (与线上失效动作逐字对齐):
+    #  1) 撤回: 撤回事务对该论文全部版本 (不限发布序号) 置 invalidated=true;
+    #  2) 更正请求: 发起更正请求时对"该论文、该请求发布序号"的现存快照置
+    #     invalidated=true; 被更正的评语以 original_receipt 冻结, 而该序号当时
+    #     现存快照的两份收据必含被冻结的收据 (连续更正时每次冻结的收据互不相同,
+    #     被更正槽位只匹配其自己的更正请求), 故以
+    #     (paper_id, serial) 更正请求集合中的 original_receipt 与快照两份收据取交集
+    #     作为跨记录判据; 更正完成后按新收据重新发布的快照不命中, 保持有效。
+    # 跨发布序号 (serial < 当前序号) 的历史快照不因"序号过期"要求失效标记: 它们本就
+    # 由读口径中的"序号须为当前发布序号"拒绝读取, 仅作历史保留迁移, 无复活风险。
+    superseded_receipts: dict[tuple, set] = {}
+    for c in data["review_corrections"]:
+        superseded_receipts.setdefault((c["paper_id"], c["serial"]), set()).add(
+            c["original_receipt"]
+        )
+    for s in data["feedback_snapshots"]:
+        where = "data.feedback_snapshots"
+        revoked_by_withdrawal = s["paper_id"] in withdrawn_ids
+        revoked_by_correction = bool(
+            superseded_receipts.get((s["paper_id"], s["serial"]), set())
+            & {s["receipt1"], s["receipt2"]}
+        )
+        must_invalidate = revoked_by_withdrawal or revoked_by_correction
+        if must_invalidate and not s["invalidated"]:
+            causes = []
+            if revoked_by_withdrawal:
+                causes.append("论文已撤回 (撤回事务令该稿全部快照访问码失效)")
+            if revoked_by_correction:
+                causes.append(
+                    f"发布序号 {s['serial']} 存在冻结该评语收据的评语更正请求"
+                    " (更正请求发起时访问码已失效)"
+                )
+            _fail(
+                where,
+                f"快照 id={s['id']} (论文 {s['paper_id']!r}, 序号 {s['serial']},"
+                f" 版本 {s['version']}) 的访问码已失效但失效标记被改回有效:"
+                + "; ".join(causes)
+                + " —— 已失效快照不能因仍属当前发布序号而复活, 拒绝恢复",
+            )
+        if s["invalidated"] and not must_invalidate:
+            _fail(
+                where,
+                f"快照 id={s['id']} (论文 {s['paper_id']!r}, 序号 {s['serial']},"
+                f" 版本 {s['version']}) 带失效标记, 但既无该论文撤回记录,"
+                " 也无同论文同发布序号冻结其评语收据的更正请求"
+                " (失效标记必须与撤回/更正跨记录一致), 拒绝恢复",
+            )
 
     # ---- 评审保障等级 (随论文删除/撤回级联清除: 必须指向现存未撤回论文)
     seen = set()
