@@ -853,3 +853,332 @@ def test_export_isolated_from_concurrent_writes(client):
     assert "PX-LATE" in {
         p["paper_id"] for p in client.get("/papers", headers=ORG).json()["papers"]
     }
+
+
+# -------------------------------- 访问码效力跨记录核验 (复活攻击防护)
+
+def build_corrected_snapshot_state(client):
+    """单论文场景: 发布 -> 确认/评语 -> 快照 v1 -> 发起更正并完成 -> 重发 v2。
+
+    返回 (serial, v1_code, v2_code, 旧收据, 新收据); v1 已因更正失效, v2 当前有效。
+    """
+    for rid in ("R1", "R2"):
+        assert add_reviewer(client, rid, capacity=3).status_code == 201
+    assert add_paper(client, "P1", institutions=["Author-P1"]).status_code == 201
+    serial = publish(client)["serial"]
+    decide(client, "R1", "P1", "confirm")
+    decide(client, "R2", "P1", "confirm")
+    old_receipt = submit_review(client, "R1", "P1", serial, score=3, comment="初版评语 R1")["receipt"]
+    submit_review(client, "R2", "P1", serial, score=4, comment="初版评语 R2")
+    v1 = client.post("/papers/P1/feedback-snapshot", headers=ORG, json={"serial": serial})
+    assert v1.status_code == 200
+    v1_code = v1.json()["access_code"]
+
+    req = client.post(
+        "/papers/P1/review-corrections",
+        headers=ORG,
+        json={"paper_id": "P1", "serial": serial, "reviewer_id": "R1",
+              "reason": "评分与评语不符, 请更正"},
+    )
+    assert req.status_code == 200 and req.json()["invalidated_snapshots"] == 1
+    corr = client.post(
+        "/reviewer/review-corrections/P1",
+        headers=reviewer_headers("R1"),
+        json={"paper_id": "P1", "serial": serial, "original_receipt": old_receipt,
+              "score": 5, "comment": "更正后评语 R1"},
+    )
+    assert corr.status_code == 200
+    new_receipt = corr.json()["receipt"]
+
+    v2 = client.post("/papers/P1/feedback-snapshot", headers=ORG, json={"serial": serial})
+    assert v2.status_code == 200 and v2.json()["version"] == 2
+    v2_code = v2.json()["access_code"]
+    # 旧码已不可读, 新码可读
+    assert client.get(f"/feedback-snapshots/{v1_code}").status_code == 404
+    assert client.get(f"/feedback-snapshots/{v2_code}").status_code == 200
+    return serial, v1_code, v2_code, old_receipt, new_receipt
+
+
+def build_pending_correction_state(client):
+    """发布 -> 确认/评语 -> 快照 v1 -> 发起更正但不完成 (快照保持失效)。"""
+    for rid in ("R1", "R2"):
+        assert add_reviewer(client, rid, capacity=3).status_code == 201
+    assert add_paper(client, "P1", institutions=["Author-P1"]).status_code == 201
+    serial = publish(client)["serial"]
+    decide(client, "R1", "P1", "confirm")
+    decide(client, "R2", "P1", "confirm")
+    receipt = submit_review(client, "R1", "P1", serial, score=3, comment="评语 R1")["receipt"]
+    submit_review(client, "R2", "P1", serial, score=4, comment="评语 R2")
+    v1 = client.post("/papers/P1/feedback-snapshot", headers=ORG, json={"serial": serial})
+    assert v1.status_code == 200
+    code = v1.json()["access_code"]
+    req = client.post(
+        "/papers/P1/review-corrections",
+        headers=ORG,
+        json={"paper_id": "P1", "serial": serial, "reviewer_id": "R1",
+              "reason": "评分与评语不符, 请更正"},
+    )
+    assert req.status_code == 200 and req.json()["invalidated_snapshots"] == 1
+    assert client.get(f"/feedback-snapshots/{code}").status_code == 404
+    return serial, code, receipt
+
+
+def test_restore_roundtrip_within_serial_correction_and_republish(client):
+    """合法的同发布序号连续更正与再次发布: 旧版失效、新版有效, 可迁移。"""
+    serial, v1_code, v2_code, _old, _new = build_corrected_snapshot_state(client)
+    snap = export_snapshot(client)
+    wipe_instance()
+    r = restore_snapshot(client, snap)
+    assert r.status_code == 200, r.text
+    # 恢复后仅当前有效码可读
+    assert client.get(f"/feedback-snapshots/{v2_code}").status_code == 200
+    assert client.get(f"/feedback-snapshots/{v1_code}").status_code == 404
+    # 当前有效码可提交异议, 失效旧码不可
+    ok = client.post(
+        "/feedback-objections",
+        json={"access_code": v2_code, "label": 1, "reason": "对新评语有异议"},
+    )
+    assert ok.status_code == 200
+    bad = client.post(
+        "/feedback-objections",
+        json={"access_code": v1_code, "label": 1, "reason": "旧码复活提交异议"},
+    )
+    assert bad.status_code == 404
+    # 历史版本仍供会务方追溯
+    versions = client.get("/papers/P1/feedback-snapshots", headers=ORG).json()["snapshots"]
+    assert [s["version"] for s in versions] == [1, 2]
+    assert versions[0]["active"] is False and versions[1]["active"] is True
+
+
+def test_restore_roundtrip_cross_serial_historical_snapshots(client):
+    """跨发布序号的历史快照 (旧序号失效、新序号有效) 可正常迁移。"""
+    for rid in ("R1", "R2", "R3"):
+        add_reviewer(client, rid, capacity=3)
+    add_paper(client, "P1", institutions=["Author-P1"])
+    s1 = publish(client)["serial"]
+    decide(client, "R1", "P1", "confirm")
+    decide(client, "R2", "P1", "confirm")
+    submit_review(client, "R1", "P1", s1, score=4, comment="s1 评语 R1")
+    submit_review(client, "R2", "P1", s1, score=4, comment="s1 评语 R2")
+    old = client.post("/papers/P1/feedback-snapshot", headers=ORG, json={"serial": s1})
+    assert old.status_code == 200
+    old_code = old.json()["access_code"]
+
+    # R2 回避 -> 补位 R3, 发布序号推进
+    decide(client, "R2", "P1", "recuse", reason="利益冲突")
+    bf = client.post("/assignment/backfill/dry-run", headers=ORG).json()
+    bp = client.post(
+        "/assignment/backfill/publish",
+        headers=ORG,
+        json={"base_revision": bf["revision"], "base_serial": bf["serial"]},
+    )
+    assert bp.status_code == 200
+    s2 = bp.json()["serial"]
+    decide(client, "R3", "P1", "confirm")
+    submit_review(client, "R3", "P1", s2, score=5, comment="s2 评语 R3")
+    new = client.post("/papers/P1/feedback-snapshot", headers=ORG, json={"serial": s2})
+    assert new.status_code == 200
+    new_code = new.json()["access_code"]
+    assert client.get(f"/feedback-snapshots/{old_code}").status_code == 404
+
+    snap = export_snapshot(client)
+    wipe_instance()
+    assert restore_snapshot(client, snap).status_code == 200
+    assert client.get(f"/feedback-snapshots/{new_code}").status_code == 200
+    assert client.get(f"/feedback-snapshots/{old_code}").status_code == 404
+    versions = client.get("/papers/P1/feedback-snapshots", headers=ORG).json()["snapshots"]
+    assert {s["serial"] for s in versions} == {s1, s2}
+    assert [s["active"] for s in versions] == [False, True]
+
+
+def test_restore_roundtrip_pending_correction_state(client):
+    """待更正请求尚未完成时导出: 该组快照全部失效, 迁移后旧码仍 404。"""
+    serial, code, _receipt = build_pending_correction_state(client)
+    snap = export_snapshot(client)
+    wipe_instance()
+    assert restore_snapshot(client, snap).status_code == 200
+    assert client.get(f"/feedback-snapshots/{code}").status_code == 404
+    # 待更正任务仍在, 评审人可在目标实例继续完成更正, 再重新发布
+    assert client.get(
+        "/reviewer/review-corrections", headers=reviewer_headers("R1")
+    ).json()["corrections"][0]["state"] == "pending"
+
+
+def test_restore_roundtrip_withdrawn_paper_snapshots(client):
+    """撤回稿的全部快照失效但保留, 迁移后旧码 404、历史仍可追溯。"""
+    serial, _v1_code, v2_code, _old, _new = build_corrected_snapshot_state(client)
+    rev = current_revision(client)
+    wd = client.post(
+        "/papers/P1/withdrawal",
+        headers=ORG,
+        json={"paper_id": "P1", "base_revision": rev, "reason": "一稿多投"},
+    )
+    assert wd.status_code == 200 and wd.json()["invalidated_snapshots"] == 1
+    assert client.get(f"/feedback-snapshots/{v2_code}").status_code == 404
+
+    snap = export_snapshot(client)
+    wipe_instance()
+    assert restore_snapshot(client, snap).status_code == 200
+    assert client.get(f"/feedback-snapshots/{v2_code}").status_code == 404
+    versions = client.get("/papers/P1/feedback-snapshots", headers=ORG).json()["snapshots"]
+    assert all(s["active"] is False for s in versions)
+
+
+def test_restore_rejects_revived_old_snapshot_flag_flip(client):
+    """攻击: 把已被更正失效的旧快照 invalidated 改回 0 并重算校验和 -> 422。"""
+    _serial, v1_code, v2_code, _old, _new = build_corrected_snapshot_state(client)
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def mutate(data):
+        s = next(x for x in data["feedback_snapshots"] if x["access_code"] == v1_code)
+        s["invalidated"] = False
+
+    _expect_invalid_snapshot(client, snap, mutate, "应当已失效")
+    # 失败后目标实例不留任何部分数据, 仍是干净空实例 (可直接恢复原快照)
+    assert restore_snapshot(client, snap).status_code == 200
+    assert client.get(f"/feedback-snapshots/{v1_code}").status_code == 404
+    assert client.get(f"/feedback-snapshots/{v2_code}").status_code == 200
+
+
+def test_restore_rejects_revived_snapshot_with_single_version(client):
+    """攻击: 同序号只有一版, 更正完成后未重发, 把唯一快照标记改回有效 -> 422。
+
+    版本链无法识别 (没有更高版本), 必须由更正记录的完成时刻判定;
+    同时该快照收据也已不在现行评语上。
+    """
+    _serial, code, _receipt = build_pending_correction_state(client)
+    # 再让评审人完成更正 (但不重新发布快照)
+    corr = client.post(
+        "/reviewer/review-corrections/P1",
+        headers=reviewer_headers("R1"),
+        json={"paper_id": "P1", "serial": _serial, "original_receipt": _receipt,
+              "score": 5, "comment": "更正后评语 R1"},
+    )
+    assert corr.status_code == 200
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def mutate(data):
+        s = next(x for x in data["feedback_snapshots"] if x["access_code"] == code)
+        s["invalidated"] = False
+
+    _expect_invalid_snapshot(client, snap, mutate, "应当已失效")
+
+
+def test_restore_rejects_revived_pending_correction_snapshot(client):
+    """攻击: 待更正请求仍在, 把该组快照失效标记改回有效 -> 422。
+
+    待更正期间不允许发布快照, 故组内全部快照必须保持失效
+    (即使把快照时间戳改到未来, "存在待完成更正请求"这一记录仍拦截复活)。
+    """
+    _serial, code, _receipt = build_pending_correction_state(client)
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def flip_only(data):
+        next(x for x in data["feedback_snapshots"] if x["access_code"] == code)["invalidated"] = False
+
+    _expect_invalid_snapshot(client, snap, flip_only, "待完成的评语更正请求")
+
+    # 同时伪造创建时间到未来: 仍被待更正请求规则拦截
+    def flip_and_fake_time(data):
+        s = next(x for x in data["feedback_snapshots"] if x["access_code"] == code)
+        s["invalidated"] = False
+        s["created_at"] = "2099-01-01T00:00:00+00:00"
+
+    _expect_invalid_snapshot(client, snap, flip_and_fake_time, "待完成的评语更正请求")
+
+
+def test_restore_rejects_revived_withdrawn_snapshot(client):
+    """攻击: 撤回稿快照标记改回有效 -> 422 (撤回记录使该稿全部快照失效)。"""
+    _serial, _v1, v2_code, _old, _new = build_corrected_snapshot_state(client)
+    rev = current_revision(client)
+    assert client.post(
+        "/papers/P1/withdrawal",
+        headers=ORG,
+        json={"paper_id": "P1", "base_revision": rev, "reason": "一稿多投"},
+    ).status_code == 200
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def mutate(data):
+        s = next(x for x in data["feedback_snapshots"] if x["access_code"] == v2_code)
+        s["invalidated"] = False
+
+    _expect_invalid_snapshot(client, snap, mutate, "论文已撤回")
+
+
+def test_restore_rejects_revived_old_snapshot_even_with_fake_timestamp(client):
+    """攻击: 旧版标记改回有效且把创建时间伪造到未来 -> 仍 422。
+
+    同发布序号内已有更高版本, 且更正请求发起时刻晚于旧版创建时间,
+    版本链与请求时刻都不依赖被伪造的创建时间; 另外其旧收据也不再是现行评语收据。
+    """
+    _serial, v1_code, _v2, old_receipt, new_receipt = build_corrected_snapshot_state(client)
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def mutate(data):
+        s = next(x for x in data["feedback_snapshots"] if x["access_code"] == v1_code)
+        s["invalidated"] = False
+        s["created_at"] = "2099-01-01T00:00:00+00:00"
+
+    _expect_invalid_snapshot(client, snap, mutate, "更新版本")
+    assert old_receipt != new_receipt
+
+
+def test_restore_rejects_active_snapshot_with_stale_receipts(client):
+    """当前序号标记有效的快照, 收据与现行槽位评语不一致 (更正后内容) -> 422。
+
+    这道核验独立于失效标记/时间戳: 即使快照标记保持有效, 收据不符即矛盾快照,
+    旧访问码不得读取已更正的反馈。
+    """
+    _serial, _v1, _v2, old_receipt, new_receipt = build_corrected_snapshot_state(client)
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def mutate(data):
+        # v2 当前有效: 把它的收据伪造成不属于当前槽位评语的伪造收据
+        # (保持幂等键不与历史版本冲突, 直达"现行评语收据"跨记录核验)
+        v2 = max(data["feedback_snapshots"], key=lambda s: s["version"])
+        v2["receipt1"] = "rvw-forged-not-current"
+
+    _expect_invalid_snapshot(client, snap, mutate, "现行评语收据")
+    assert old_receipt != new_receipt
+
+
+def test_restore_rejects_missing_snapshot_version(client):
+    """快照版本号缺号 (有版本行被删除) 与历史保留规则矛盾 -> 422。"""
+    _serial, v1_code, v2_code, _old, _new = build_corrected_snapshot_state(client)
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def mutate(data):
+        s = next(x for x in data["feedback_snapshots"] if x["access_code"] == v1_code)
+        s["version"] = 3  # 版本号 1/2 -> 2/3, 造成缺号 (幂等键不变)
+
+    _expect_invalid_snapshot(client, snap, mutate, "版本号不连续")
+
+
+def test_restore_rejects_invalidated_flag_without_cause(client):
+    """反向矛盾: 当前有效快照被改成 invalidated=1 却无撤回/更正/更高版本 -> 422。"""
+    for rid in ("R1", "R2"):
+        add_reviewer(client, rid, capacity=3)
+    add_paper(client, "P1", institutions=["Author-P1"])
+    serial = publish(client)["serial"]
+    decide(client, "R1", "P1", "confirm")
+    decide(client, "R2", "P1", "confirm")
+    submit_review(client, "R1", "P1", serial, score=4, comment="评语 R1")
+    submit_review(client, "R2", "P1", serial, score=4, comment="评语 R2")
+    code = client.post(
+        "/papers/P1/feedback-snapshot", headers=ORG, json={"serial": serial}
+    ).json()["access_code"]
+    snap = export_snapshot(client)
+    wipe_instance()
+
+    def mutate(data):
+        next(x for x in data["feedback_snapshots"] if x["access_code"] == code)["invalidated"] = True
+
+    _expect_invalid_snapshot(client, snap, mutate, "无对应的失效记录")
+

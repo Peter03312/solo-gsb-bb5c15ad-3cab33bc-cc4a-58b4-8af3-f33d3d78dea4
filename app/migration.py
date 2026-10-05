@@ -17,6 +17,15 @@
   当前序号的决定/评语必须落在当前发布方案槽位上、各表主键/唯一约束不冲突);
   历史记录 (决定/评语/回避/资格变更/更正/快照/异议) 按保留规则可指向已删除的
   论文或评审人, 不作存在性要求;
+- **访问码效力的跨记录核验** (防"旧快照失效标记被改回有效并重算校验和"的伪造快照):
+  不只看 feedback_snapshots.invalidated 标记本身, 而是依据快照版本 (同论文同发布
+  序号内仅最高版本可能有效)、评语更正请求 (不晚于更正请求发起时刻创建的快照必已
+  随请求失效; 组内存在待完成更正请求时全部失效) 与论文撤回记录 (撤回稿全部快照
+  失效) 重算每个访问码的应有效力, 并与快照标记逐行比对; 对当前发布序号上仍标记
+  有效的快照, 还要其两份评语收据与当前发布方案槽位上的现行评语收据一致 (更正会
+  原地更换收据, 故仅凭改标记/改时间无法让旧快照复活)。任何不一致即"矛盾快照"
+  422 拒绝; 合法的连续更正、同序号再次发布与跨发布序号历史快照均可迁移, 恢复后
+  仅当前有效码可读快照并提交异议, 历史内容仍供会务方追溯;
 - 仅接受尚无业务记录 (全部业务表为空且资料修订号为 0) 且从未恢复过的目标实例;
   校验失败 (422)、目标非空或重复恢复 (409) 一律拒绝且不留下部分数据——
   全部写入在同一个 BEGIN IMMEDIATE 写事务内完成, 任一失败整体回滚;
@@ -429,6 +438,13 @@ def validate_snapshot(data) -> None:
     但锁定表与保障等级随论文删除/撤回级联清除、撤回记录与 withdrawn 标记一一对应、
     异议必须指向现存快照版本、按发布序号隔离的记录不得越过当前发布序号、
     当前序号的决定/评语必须落在当前发布方案槽位上——这些不变量必须成立。
+
+    访问码效力不接受快照自报的 invalidated 标记: 另由 快照版本链、评语更正请求的
+    发起时刻/待完成状态、论文撤回记录重算每个快照的应失效状态并逐行比对
+    (同论文同序号仅最高版本可能有效; 不晚于更正请求发起时刻创建的版本必已失效;
+    有待完成更正请求的组全部失效; 撤回稿全部失效); 当前发布序号上标记有效的快照,
+    其两份评语收据还必须等于当前方案槽位的现行评语收据。任一不一致即矛盾快照 422,
+    防止"改回失效标记并重算校验和"使旧访问码复活、再次读取已更正反馈或提交异议。
     """
     if not isinstance(data, dict):
         _fail("data", "必须是对象")
@@ -875,7 +891,122 @@ def validate_snapshot(data) -> None:
         _check_stamped_revision(dline["revision"], where)
         _check_unique(seen, dline["serial"], where, "截止行")
 
+    # ---- 跨记录核验: 访问码效力必须可由 快照版本/更正请求/撤回记录 重算
+    #
+    # 背景: 旧快照的失效 (更正请求发起、异议受理走更正流程、论文撤回) 在库中只体现为
+    # feedback_snapshots.invalidated=1。若有人导出后把该标记改回 0 并重算校验和,
+    # 仅核对标记本身会接受伪造快照, 旧访问码在目标实例将再次可读已更正的反馈、
+    # 甚至再次提交异议。因此恢复前必须依据其它业务记录重算每个访问码的应有效力,
+    # 标记与重算结果不一致即为"矛盾快照"。
+    #
+    # 效力规则 (与会话内运行时口径一致, 历史版本仅供会务方追溯):
+    #   1. 已撤回论文: 该稿全部快照失效 (撤回同事务失效所有访问码);
+    #   2. 同 (论文, 发布序号) 内按版本仅最高一版可能有效: 同序号再次发布 version+1,
+    #      旧版在更正请求发起时已被置失效;
+    #   3. 更正请求 (不论 pending/completed): 快照创建不晚于该请求发起时刻
+    #      (requested_at) 的版本, 已在请求发起的同一事务失效; 待更正期间不允许发布,
+    #      故 pending 请求时组内全部失效; completed 请求之后的重发版本创建时间必晚于
+    #      requested_at, 才可能有效;
+    # 时间戳只能辅助判定; 对当前发布序号上"标记有效"的快照, 还以现行评语收据核对
+    # (更正会原地更换 submitted_reviews 的收据): 改标记/改时间而无对应收据, 复活不成立。
+    snapshots = sorted(data["feedback_snapshots"], key=lambda s: s["id"])
+    version_by_paper = {}
+    groups = {}
+    for s in snapshots:
+        _check_unique(version_by_paper.setdefault(s["paper_id"], set()), s["version"],
+                      "data.feedback_snapshots", "同论文快照 version")
+        groups.setdefault((s["paper_id"], s["serial"]), []).append(s)
 
+    # 版本号按论文连续分配 (MAX(version)+1), 不允许缺号: 缺号意味着有版本行被删除,
+    # 而快照版本永不删除 (仅失效并保留供会务方追溯)
+    for pid, versions in version_by_paper.items():
+        if sorted(versions) != list(range(1, len(versions) + 1)):
+            _fail(
+                "data.feedback_snapshots",
+                f"论文 {pid!r} 的快照版本号不连续: {sorted(versions)}"
+                " (快照版本永不删除, 缺失版本与历史保留规则矛盾)",
+            )
+
+    # 更正记录按 (论文, 序号) 汇总; 只用于重算该组快照的应有效力
+    corrections_by_group = {}
+    for c in data["review_corrections"]:
+        corrections_by_group.setdefault((c["paper_id"], c["serial"]), []).append(c)
+
+    # 当前发布方案槽位 -> 现行评语收据: 恢复后"当前有效"码必须读到的仍是现行评语
+    current_review_receipts = {}
+    for r in data["submitted_reviews"]:
+        if r["serial"] == max_serial:
+            current_review_receipts[(r["paper_id"], r["reviewer_id"])] = r["receipt"]
+
+    for (pid, serial), group_snaps in groups.items():
+        where = f"data.feedback_snapshots[paper_id={pid!r}, serial={serial}]"
+        ordered = sorted(group_snaps, key=lambda s: s["version"])
+        latest_version = ordered[-1]["version"]
+        corrections = corrections_by_group.get((pid, serial), [])
+        has_pending = any(c["state"] == "pending" for c in corrections)
+        # 最晚的更正请求发起时刻: 不晚于该时刻创建的版本已随请求发起而失效
+        latest_requested_at = max(c["requested_at"] for c in corrections) if corrections else None
+
+        for s in ordered:
+            expect_invalidated = False
+            reasons = []
+            if pid in withdrawn_ids:
+                expect_invalidated = True
+                reasons.append("论文已撤回")
+            if s["version"] != latest_version:
+                expect_invalidated = True
+                reasons.append("同发布序号内已有更新版本")
+            if has_pending:
+                expect_invalidated = True
+                reasons.append("该论文在该发布序号上存在待完成的评语更正请求")
+            if latest_requested_at is not None and s["created_at"] <= latest_requested_at:
+                expect_invalidated = True
+                reasons.append("快照创建不晚于评语更正请求发起时刻 (请求发起时已失效)")
+            if bool(s["invalidated"]) != expect_invalidated:
+                if expect_invalidated:
+                    _fail(
+                        where,
+                        f"快照版本 {s['version']} (访问码 {s['access_code']!r}) 的失效标记"
+                        " 被置为有效, 但依据业务记录它应当已失效 ("
+                        + "; ".join(reasons)
+                        + ")——已因更正或撤回失效的快照不能因仍属当前发布序号而复活",
+                    )
+                _fail(
+                    where,
+                    f"快照版本 {s['version']} (访问码 {s['access_code']!r}) 标记为已失效,"
+                    " 但无对应的失效记录 (撤回记录/更高版本/更正请求);"
+                    " 失效标记必须与快照版本、更正请求和撤回记录一致",
+                )
+
+            # 当前发布序号上标记有效的快照: 恢复后其访问码将立即可读、可提异议,
+            # 两份评语收据必须就是当前方案槽位上的现行评语收据 (更正会换收据,
+            # 旧收据快照在更正链上必已失效), 否则快照内容与现行评语矛盾。
+            if s["serial"] == max_serial and not s["invalidated"] and published is not None:
+                pair = published["plan"].get(pid)
+                if pair is None:
+                    _fail(
+                        where,
+                        f"快照版本 {s['version']} 在当前发布序号上标记有效, 但论文 {pid!r}"
+                        " 不在当前发布方案中 (该码恢复后无对应槽位却可读, 快照与方案矛盾)",
+                    )
+                else:
+                    current_receipt_set = {
+                        current_review_receipts.get((pid, rid)) for rid in pair
+                    }
+                    if (
+                        None in current_receipt_set
+                        or {s["receipt1"], s["receipt2"]} != current_receipt_set
+                    ):
+                        _fail(
+                            where,
+                            f"快照版本 {s['version']} (访问码 {s['access_code']!r})"
+                            " 在当前发布序号上标记有效, 但其评语收据与当前发布方案槽位上的"
+                            "现行评语收据不一致 (评语已被更正或替换却仍标记有效,"
+                            " 旧访问码不得再次读取已更正的反馈)",
+                        )
+
+
+# ---------------------------------------------------------------- 恢复
 # ---------------------------------------------------------------- 恢复
 
 def assert_restorable_target(conn: sqlite3.Connection) -> None:
